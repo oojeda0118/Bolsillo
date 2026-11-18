@@ -428,7 +428,7 @@ function defaults() {
       { id: uid(), name: 'Banco', currency: 'VES', icon: '🏦', initial: 0, archived: false },
     ],
     categories: templateCats(),
-    tx: [], recurring: [], budgets: [], tags: [], goals: [], debts: [],
+    tx: [], recurring: [], budgets: [], tags: [], tagsHidden: [], goals: [], debts: [],
     settings: { lastBackup: null, widgets: defaultWidgets() },
   };
 }
@@ -441,6 +441,7 @@ function migrate(s) {
   s.settings = s.settings || { lastBackup: null };
   s.budgets = Array.isArray(s.budgets) ? s.budgets : [];
   s.tags = Array.isArray(s.tags) ? s.tags : [];
+  s.tagsHidden = Array.isArray(s.tagsHidden) ? s.tagsHidden : [];
   s.goals = Array.isArray(s.goals) ? s.goals : [];
   s.debts = Array.isArray(s.debts) ? s.debts : [];
   s.categories.forEach((c, i) => { if (c.parentId === undefined) c.parentId = null; if (!c.parentId && !c.color) c.color = CAT_COLORS[i % CAT_COLORS.length]; });
@@ -500,6 +501,17 @@ let draft = null, sheetRender = null;
 const acc = id => state.accounts.find(a => a.id === id);
 const cat = id => state.categories.find(c => c.id === id);
 const isUSD = id => acc(id)?.currency === 'USD';
+const txUsd = t => isUSD(t.accountId) ? t.amount : (t.usd || 0);
+function lastFxRate() {
+  const r = state.tx.filter(t => t.rate > 0 && acc(t.accountId)?.currency === 'VES').sort((a, b) => b.date.localeCompare(a.date) || (b.created || 0) - (a.created || 0))[0];
+  return r ? r.rate : null;
+}
+function usdSuggest(d) {
+  const bs = parseAmt(d.amount), r = lastFxRate();
+  if (!(bs > 0) || !r) return '';
+  const v = Math.round(bs / r * 100) / 100;
+  return `<button type="button" class="chip" style="margin-top:8px" data-act="useUsd" data-v="${v}">Usar ${money(v)} (tasa ${nfRate.format(r)})</button>`;
+}
 const hasTx = accId => state.tx.some(t => t.accountId === accId || t.toAccountId === accId) || state.recurring.some(r => r.accountId === accId);
 const catUsed = id => state.tx.some(t => t.categoryId === id) || state.recurring.some(r => r.categoryId === id);
 const catTop = c => (c && c.parentId && cat(c.parentId)) || c;
@@ -562,7 +574,7 @@ function txRow(t) {
   }
   if (t.note) sub.push(t.note);
   if (t.tags?.length) sub.push(t.tags.map(g => '#' + g).join(' '));
-  if (t.rate) sub.push('tasa ' + nfRate.format(t.rate));
+  if (t.usd) sub.push('≈ ' + money(t.usd)); else if (t.rate) sub.push('tasa ' + nfRate.format(t.rate));
   return `<button class="row${cur === 'VES' ? ' bs' : ''}" data-act="editTx" data-id="${t.id}">
 <span class="ico${ist ? ' c' : ''}" style="${ist}">${icon}</span>
     <span class="main"><span class="t">${esc(title)}</span><span class="s">${esc(sub.filter(Boolean).join(', '))}</span></span>
@@ -661,8 +673,9 @@ function periodShift(b, ref, n) {
 }
 function budgetStatus(b, offset = 0) {
   const t = today(); const [s, e] = budgetWindow(b, periodShift(b, t, offset)); const set = budgetCatSet(b);
-  const txs = state.tx.filter(x => x.type === 'expense' && isUSD(x.accountId) && x.date >= s && x.date <= e && budgetMatch(b, x, set));
-  const spent = txs.reduce((a, x) => a + x.amount, 0);
+  const specific = !!(b.categoryIds?.length || b.tags?.length);
+  const txs = state.tx.filter(x => x.type === 'expense' && (isUSD(x.accountId) || (specific && x.usd > 0)) && x.date >= s && x.date <= e && budgetMatch(b, x, set));
+  const spent = txs.reduce((a, x) => a + txUsd(x), 0);
   const total = daysBetween(s, e) + 1, upcoming = t < s, finished = t > e;
   const elapsed = upcoming ? 0 : finished ? total : daysBetween(s, t) + 1;
   const daysLeft = upcoming ? total : finished ? 0 : total - elapsed + 1;
@@ -981,21 +994,24 @@ function vBudgets() {
       ${list.length > 4 ? `<button class="more-btn" data-act="budMore" data-v="${key}">${more ? 'Mostrar menos' : `Mostrar ${list.length - 4} más`}</button>` : ''}</div>`;
   }
   if (!any) h += `<div class="empty" style="margin-top:12px"><p>${tab === 'periodic' ? 'No tienes presupuestos semanales, mensuales, anuales ni personalizados.' : 'No tienes presupuestos únicos. Sirven para un viaje, una mudanza o un evento.'}</p><button class="btn" data-act="newBud">Crear presupuesto</button></div>`;
-  return h + `<p class="note">Toca un presupuesto para ver su detalle. La parte clara de la barra es la proyección: hasta dónde llegarías si sigues gastando al mismo ritmo. Solo cuentan los gastos de tus cuentas en dólares.</p>`;
+  return h + `<p class="note">Toca un presupuesto para ver su detalle. La parte clara de la barra es la proyección: hasta dónde llegarías si sigues gastando al mismo ritmo. Cuentan tus gastos en dólares y, en presupuestos con categorías o etiquetas, también los gastos en Bs a los que les pusiste su equivalente en $.</p>`;
 }
 function allTags() {
   const set = new Set(state.tags);
   state.tx.forEach(t => (t.tags || []).forEach(g => set.add(g)));
   return [...set].sort((a, b) => a.localeCompare(b, 'es'));
 }
+const pickTags = sel => [...new Set([...allTags().filter(g => !state.tagsHidden.includes(g)), ...sel])];
 function vTags() {
   const tags = allTags();
   const cnt = g => state.tx.filter(t => (t.tags || []).includes(g)).length;
-  return `${backBtn()}<h1>Etiquetas</h1>
-    <p class="hint">Las etiquetas agrupan gastos de distintas categorías, por ejemplo #viaje o #cumpleaños. Se crean al registrar un movimiento.</p>
-    ${tags.length ? `<div class="list" style="margin-top:12px">${tags.map(g => `<button class="row" data-act="editTag" data-v="${esc(g)}"><span class="ico">🏷️</span><span class="main"><span class="t">#${esc(g)}</span><span class="s">${cnt(g)} movimientos</span></span><span class="chev">›</span></button>`).join('')}</div>` : `<div class="empty" style="margin-top:12px"><p>Aún no has usado etiquetas.</p></div>`}`;
+  const row = g => { const n = cnt(g); return `<button class="row" data-act="editTag" data-v="${esc(g)}"><span class="ico">🏷️</span><span class="main"><span class="t">#${esc(g)}</span><span class="s">${n ? (n === 1 ? '1 movimiento' : n + ' movimientos') : 'Sin movimientos aún'}</span></span><span class="chev">›</span></button>`; };
+  const act = tags.filter(g => !state.tagsHidden.includes(g)), off = tags.filter(g => state.tagsHidden.includes(g));
+  return `${backBtn()}<div class="navrow"><h1>Etiquetas</h1><button class="btn sm" data-act="newTag">Nueva</button></div>
+    <p class="hint">Las etiquetas agrupan gastos de distintas categorías, por ejemplo #viaje o #cumpleaños. Toca una para renombrarla, desactivarla o eliminarla.</p>
+    ${act.length ? `<h2 class="sec">Activas</h2><div class="list">${act.map(row).join('')}</div>` : (off.length ? '' : `<div class="empty" style="margin-top:12px"><p>Aún no tienes etiquetas.</p><button class="btn" data-act="newTag">Crear etiqueta</button></div>`)}
+    ${off.length ? `<h2 class="sec">Inactivas</h2><p class="hint" style="margin:-2px 4px 8px">No aparecen al registrar movimientos ni al crear presupuestos, pero conservan su historial.</p><div class="list">${off.map(row).join('')}</div>` : ''}`;
 }
-
 function vGoals() {
   const act = state.goals.filter(g => !g.done), done = state.goals.filter(g => g.done);
   return `${backBtn()}<div class="navrow"><h1>Objetivos</h1><button class="btn sm" data-act="newGoal">Nuevo</button></div>
@@ -1092,7 +1108,7 @@ function catPicker(k, type, val, multi = false) {
 /* Movimiento */
 function openTx(t, preset = {}) {
   if (t) {
-    draft = { ...t, amount: fmtIn(t.amount), rate: t.rate ? fmtIn(t.rate) : '', fxAccountId: '', fxAmount: '', tags: [...(t.tags || [])], newTag: '' };
+    draft = { ...t, amount: fmtIn(t.amount), rate: t.rate ? fmtIn(t.rate) : '', fxAccountId: '', fxAmount: '', tags: [...(t.tags || [])], newTag: '', usdEq: t.usd ? fmtIn(t.usd) : '' };
     if (t.linkId) { const l = state.tx.find(x => x.id === t.linkId); if (l) { draft.fxAccountId = l.accountId; draft.fxAmount = fmtIn(l.amount); } }
   } else {
     let accountId = (ui.tab === 'moves' && ui.filterAcc !== 'all' && acc(ui.filterAcc) && !acc(ui.filterAcc).archived) ? ui.filterAcc : null;
@@ -1122,11 +1138,14 @@ function renderTxSheet() {
         ${d.fxAccountId ? field('Bolívares recibidos', `<input data-k="fxAmount" inputmode="decimal" placeholder="0,00" value="${esc(d.fxAmount)}" autocomplete="off">`) : ''}</div>`;
     }
   }
-  if (cur === 'VES') h += field('Tasa de referencia (opcional)', `<input data-k="rate" inputmode="decimal" placeholder="Solo como nota" value="${esc(d.rate)}" autocomplete="off">`);
+  if (cur === 'VES' && d.type === 'expense') {
+    h += field('¿Cuántos $ fueron? (opcional)', `<input data-k="usdEq" inputmode="decimal" placeholder="Déjalo vacío si no importa" value="${esc(d.usdEq || '')}" autocomplete="off">`) +
+      `<div id="usd-suggest">${usdSuggest(d)}</div><p class="hint">Solo se usa en tus presupuestos con categorías o etiquetas. No cambia tus reportes ni tu saldo.</p>`;
+  } else if (cur === 'VES') h += field('Tasa de referencia (opcional)', `<input data-k="rate" inputmode="decimal" placeholder="Solo como nota" value="${esc(d.rate)}" autocomplete="off">`);
   h += field('Fecha', `<input type="date" data-k="date" value="${esc(d.date)}">`);
   h += field('Nota', `<input data-k="note" placeholder="Opcional" value="${esc(d.note)}" autocomplete="off">`);
   if (d.type !== 'transfer') {
-    const tags = [...new Set([...allTags(), ...d.tags])];
+    const tags = pickTags(d.tags);
     h += `<p class="flabel">Etiquetas</p>`;
     if (tags.length) h += `<div class="chips">${tags.map(g => `<button type="button" class="chip ${d.tags.includes(g) ? 'on' : ''}" data-act="toggle" data-k="tags" data-v="${esc(g)}">#${esc(g)}</button>`).join('')}</div>`;
     h += `<div class="tagrow"><input data-k="newTag" placeholder="Nueva etiqueta" value="${esc(d.newTag)}" autocomplete="off"><button type="button" class="btn sm ghost" data-act="addTag">Añadir</button></div>`;
@@ -1149,6 +1168,8 @@ function saveTx() {
     if (d.tags.length) { rec.tags = [...d.tags]; d.tags.forEach(g => { if (!state.tags.includes(g)) state.tags.push(g); }); }
   }
   const rate = parseAmt(d.rate, 4); if (a.currency === 'VES' && rate > 0) rec.rate = rate;
+  const usdEq = parseAmt(d.usdEq);
+  if (a.currency === 'VES' && d.type === 'expense' && usdEq > 0) { rec.usd = usdEq; rec.rate = Math.round(amount / usdEq * 10000) / 10000; }
   // Venta de divisas: anota opcionalmente los Bs recibidos en la bitácora
   const fxAmt = parseAmt(d.fxAmount); const c = cat(d.categoryId);
   const oldLink = old?.linkId;
@@ -1326,9 +1347,9 @@ function openBud(b) {
     if (d.period === 'once') h += `<p class="hint">Un solo período con fechas fijas, por ejemplo un viaje o una mudanza.</p>` + field('Desde', `<input type="date" data-k="start" value="${esc(d.start)}">`) + field('Hasta', `<input type="date" data-k="end" value="${esc(d.end)}">`);
     else if (d.period === 'custom') h += field('Cada cuántos días', `<input data-k="every" inputmode="numeric" value="${esc(d.every)}" placeholder="15">`) + `<p class="hint">Por ejemplo, 15 para quincenas o 14 para cada dos semanas.</p>` + field('Primer día', `<input type="date" data-k="start" value="${esc(d.start)}">`);
     else h += `<p class="hint">${{ weekly: 'Se reinicia cada lunes.', monthly: 'Se reinicia el día 1 de cada mes.', yearly: 'Se reinicia cada 1 de enero.' }[d.period]}</p>`;
-    h += `<p class="flabel">Categorías</p><p class="hint" style="margin:0 4px 8px">Si no eliges ninguna, cuentan todos tus gastos en dólares. Elegir un grupo incluye todas sus subcategorías.</p>`;
+    h += `<p class="flabel">Categorías</p><p class="hint" style="margin:0 4px 8px">Si no eliges ninguna, cuentan todos tus gastos en dólares. Elegir un grupo incluye todas sus subcategorías. Con categorías o etiquetas, también cuentan los gastos en Bs que tengan su equivalente en $.</p>`;
     h += catPicker('categoryIds', 'expense', d.categoryIds, true);
-    const tags = [...new Set([...allTags(), ...d.tags])];
+    const tags = pickTags(d.tags);
     if (tags.length) h += `<p class="flabel">Solo con estas etiquetas (opcional)</p><div class="chips">${tags.map(g => `<button type="button" class="chip ${d.tags.includes(g) ? 'on' : ''}" data-act="toggle" data-k="tags" data-v="${esc(g)}">#${esc(g)}</button>`).join('')}</div>`;
     if (d.id) h += `<button class="danger" data-act="delBud">Eliminar presupuesto</button>`;
     return h;
@@ -1371,7 +1392,7 @@ function renderBudDetail() {
   h += `<p class="hint" style="margin-top:10px">Incluye: ${esc(scope)}${b.tags?.length ? ', con ' + esc(b.tags.map(g => '#' + g).join(' ')) : ''}. ${PERIODS[b.period]}${b.period === 'custom' ? `, cada ${b.every} días` : ''}.</p>`;
   if (st.txs.length) {
     const agg = new Map();
-    st.txs.forEach(t => { const c = cat(t.categoryId); const k = c?.id || 'none'; if (!agg.has(k)) agg.set(k, { c, v: 0 }); agg.get(k).v += t.amount; });
+    st.txs.forEach(t => { const c = cat(t.categoryId); const k = c?.id || 'none'; if (!agg.has(k)) agg.set(k, { c, v: 0 }); agg.get(k).v += txUsd(t); });
     const rows = [...agg.values()].sort((a, b) => b.v - a.v);
     h += `<h2 class="sec">En qué se fue</h2><div class="card">${rows.map(r => `<div class="brk"><span class="ico c" style="${r.c ? icoBg(r.c) : ''}">${r.c?.icon || '•'}</span><span class="main"><span class="t">${esc(r.c?.name || 'Sin categoría')}</span><div class="bar"><i style="width:${(r.v / st.spent * 100).toFixed(1)}%;background:${catColor(r.c)}"></i></div></span><span class="amt">${money(r.v)}</span></div>`).join('')}</div>`;
     h += `<h2 class="sec">Gastos del período (${st.txs.length})</h2><div class="list">${sortTx([...st.txs]).map(txRow).join('')}</div>`;
@@ -1687,19 +1708,20 @@ function saveCuota() {
 /* Etiquetas */
 const cleanTag = s => String(s || '').replace(/^#+/, '').trim().replace(/\s+/g, '-').slice(0, 30);
 function openTag(name) {
-  draft = { old: name, name };
+  draft = { old: name, name, hidden: state.tagsHidden.includes(name) };
   openSheet(() => sheetHead('Etiqueta', 'saveTag') + field('Nombre', `<input data-k="name" value="${esc(draft.name)}" autocomplete="off">`) +
-    `<p class="hint">Al cambiar el nombre se actualiza en todos tus movimientos y presupuestos.</p><button class="danger" data-act="delTag">Eliminar etiqueta</button>`);
+    `<p class="hint">Al cambiar el nombre se actualiza en todos tus movimientos y presupuestos.</p><label class="check"><input type="checkbox" data-k="hidden" ${draft.hidden ? 'checked' : ''}>Inactiva (no aparece al registrar movimientos)</label><button class="danger" data-act="delTag">Eliminar etiqueta</button>`);
 }
 function renameTag(old, neu) {
   const fix = arr => { if (!arr) return arr; const r = arr.map(g => g === old ? neu : g).filter(Boolean); return [...new Set(r)]; };
   state.tx.forEach(t => { if (t.tags) { t.tags = fix(t.tags); if (!t.tags.length) delete t.tags; } });
   state.budgets.forEach(b => b.tags = fix(b.tags || []));
   state.tags = fix(state.tags);
+  state.tagsHidden = fix(state.tagsHidden || []);
 }
 function saveTag() {
   syncDraft(); const neu = cleanTag(draft.name); if (!neu) return toast('Escribe un nombre.');
-  renameTag(draft.old, neu); save(); closeSheet(); render(); toast('Etiqueta actualizada');
+  renameTag(draft.old, neu); state.tagsHidden = state.tagsHidden.filter(g => g !== neu); if (draft.hidden) state.tagsHidden.push(neu); save(); closeSheet(); render(); toast('Etiqueta actualizada');
 }
 
 /* Personalizar inicio */
@@ -1732,11 +1754,11 @@ async function exportJSON() {
 }
 function exportCSV() {
   const tl = { expense: 'gasto', income: 'ingreso', transfer: 'transferencia', adjust: 'ajuste' };
-  const rows = [['fecha', 'tipo', 'cuenta', 'moneda', 'monto', 'categoria', 'cuenta_destino', 'nota', 'tasa', 'etiquetas']];
+  const rows = [['fecha', 'tipo', 'cuenta', 'moneda', 'monto', 'categoria', 'cuenta_destino', 'nota', 'tasa', 'etiquetas', 'equivalente_usd']];
   [...state.tx].sort((a, b) => a.date.localeCompare(b.date)).forEach(t => {
     const a = acc(t.accountId);
     rows.push([t.date, tl[t.type], a?.name || '', a?.currency || '', t.type === 'expense' ? -t.amount : t.amount,
-      t.fx && !t.categoryId ? 'Cambio de divisas' : (cat(t.categoryId)?.name || ''), acc(t.toAccountId)?.name || '', t.note || '', t.rate || '', (t.tags || []).join(' ')]);
+      t.fx && !t.categoryId ? 'Cambio de divisas' : (cat(t.categoryId)?.name || ''), acc(t.toAccountId)?.name || '', t.note || '', t.rate || '', (t.tags || []).join(' '), t.usd || '']);
   });
   const csv = rows.map(r => r.map(v => { const s = String(v); return /[",;\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; }).join(',')).join('\n');
   shareOrDownload('\ufeff' + csv, `bolsillo-${today()}.csv`, 'text/csv');
@@ -1817,6 +1839,9 @@ const actions = {
   toggle: el => { syncDraft(); const arr = draft[el.dataset.k]; const v = el.dataset.v; const i = arr.indexOf(v); if (i >= 0) arr.splice(i, 1); else arr.push(v); refreshSheet(); },
   addTag: () => { syncDraft(); const g = cleanTag(draft.newTag); if (!g) return toast('Escribe el nombre de la etiqueta.'); if (!draft.tags.includes(g)) draft.tags.push(g); draft.newTag = ''; refreshSheet(); },
   customize: () => openCustomize(),
+  useUsd: el => { syncDraft(); draft.usdEq = fmtIn(+el.dataset.v); refreshSheet(); },
+  newTag: () => { draft = { _kind: 'tag', name: '' }; openSheet(() => sheetHead('Nueva etiqueta', 'saveNewTag') + field('Nombre', `<input data-k="name" value="${esc(draft.name)}" placeholder="Ej. viaje, cumpleaños" autocomplete="off">`) + `<p class="hint">Sin espacios: se reemplazan por guiones. Luego la eliges al registrar un movimiento o al crear un presupuesto.</p>`); setTimeout(() => $('#sheet-body [data-k=name]')?.focus(), 280); },
+  saveNewTag: () => { syncDraft(); const g = cleanTag(draft.name); if (!g) return toast('Escribe un nombre.'); if (allTags().includes(g)) return toast('Esa etiqueta ya existe.'); state.tags.push(g); save(); closeSheet(); render(); toast('Etiqueta creada'); },
   theme: el => { state.settings.theme = el.dataset.v; save(); applyTheme(); render(); },
   wToggle: el => { const w = state.settings.widgets[+el.dataset.i]; w.on = !w.on; save(); refreshSheet(); render(); },
   wMove: el => { const ws = state.settings.widgets, i = +el.dataset.i, j = i + +el.dataset.n; if (j < 0 || j >= ws.length) return; [ws[i], ws[j]] = [ws[j], ws[i]]; save(); refreshSheet(); render(); },
@@ -1839,6 +1864,7 @@ document.addEventListener('click', e => {
   const fn = actions[el.dataset.act]; if (fn) { e.preventDefault(); fn(el); }
 });
 document.addEventListener('input', e => {
+  if (e.target.dataset?.k === 'amount' && $('#usd-suggest') && e.target.closest('#sheet-body')) { syncDraft(); $('#usd-suggest').innerHTML = usdSuggest(draft); }
   if (draft?._kind === 'debt' && e.target.closest('#sheet-body')) { const pv = $('#debt-preview'); if (pv) { syncDraft(); pv.innerHTML = debtPreview(draft); } }
   if (e.target.id === 'q') {
     ui.q = e.target.value;
